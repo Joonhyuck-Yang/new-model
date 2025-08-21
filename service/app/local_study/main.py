@@ -19,7 +19,7 @@ from datetime import datetime
 import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from app.ananke.model import XMLRoBERTaClassifier
-from app.ananke.excel_to_jsonl import convert_excel_to_jsonl
+# from app.ananke.excel_to_jsonl import convert_excel_to_jsonl
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -84,30 +84,23 @@ class LocalStudyManager:
         
         logger.info(f"학습 히스토리가 저장되었습니다: {training_info['model_version']}번째 학습")
     
-    def prepare_training_data(self, excel_filename: str = "학습 데이터셋.xlsx") -> Tuple[List[str], List[str]]:
+    def prepare_training_data(self, jsonl_filename: str = "file for trainning.jsonl") -> Tuple[List[str], List[str]]:
         """
-        엑셀 파일을 JSONL로 변환하고 학습 데이터를 준비합니다.
+        JSONL 파일에서 학습 데이터를 준비합니다.
         
         Args:
-            excel_filename: 엑셀 파일명
+            jsonl_filename: JSONL 파일명
             
         Returns:
             texts: 텍스트 리스트
             labels: 라벨 리스트
         """
-        excel_path = self.dataforstudy_dir / excel_filename
-        jsonl_path = self.dataforstudy_dir / "training_data.jsonl"
+        jsonl_path = self.dataforstudy_dir / jsonl_filename
         
-        if not excel_path.exists():
-            raise FileNotFoundError(f"엑셀 파일을 찾을 수 없습니다: {excel_path}")
+        if not jsonl_path.exists():
+            raise FileNotFoundError(f"JSONL 파일을 찾을 수 없습니다: {jsonl_path}")
         
-        logger.info("엑셀 파일을 JSONL로 변환 중...")
-        success = convert_excel_to_jsonl(excel_path, jsonl_path)
-        
-        if not success:
-            raise RuntimeError("엑셀 파일 변환에 실패했습니다")
-        
-        logger.info("학습 데이터 준비 중...")
+        logger.info("JSONL 파일에서 학습 데이터를 준비 중...")
         texts, labels = self.classifier.prepare_training_data(jsonl_path)
         
         logger.info(f"총 {len(texts)}개의 학습 데이터가 준비되었습니다")
@@ -307,7 +300,8 @@ def main():
         
         # 모델 학습
         print("\n=== 모델 학습 시작 ===")
-        training_result = study_manager.train_model(texts, labels, epochs=3, batch_size=8)
+        # RTX 4080 최적화: 더 많은 에포크와 큰 배치로 GPU 활용도 극대화
+        training_result = study_manager.train_model(texts, labels, epochs=20, batch_size=64)
         
         print(f"\n=== 학습 완료 ===")
         print(f"학습 시간: {training_result['training_duration_seconds']:.2f}초")

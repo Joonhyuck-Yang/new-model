@@ -27,30 +27,33 @@ class XMLRoBERTaClassifier:
         
         self.model_name = model_name
         
+        # 레이블 매핑 초기화 (먼저!)
+        self.label_to_id = {}
+        self.id_to_label = {}
+        self.label_embeddings = {}
+        
         if model_dir and os.path.exists(model_dir):
             # 기존 모델 로드
             self.tokenizer = AutoTokenizer.from_pretrained(model_dir)
             self.model = AutoModel.from_pretrained(model_dir)
-            self.classifier = nn.Linear(self.model.config.hidden_size, 768)  # 임시 크기
+            # 분류기 크기는 load_classifier에서 설정됨
             self.load_classifier(model_dir)
         else:
-            # 새 모델 초기화
+            # 새 모델 초기화 (분류기 크기는 나중에 설정)
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.model = AutoModel.from_pretrained(model_name)
-            self.classifier = nn.Linear(self.model.config.hidden_size, 768)
+            # 분류기는 prepare_training_data에서 생성됨
         
         # 모델을 GPU로 이동 및 최적화
         self.model.to(self.device)
-        self.classifier.to(self.device)
+        
+        # 분류기가 아직 생성되지 않았다면 임시로 생성 (prepare_training_data에서 재생성됨)
+        if not hasattr(self, 'classifier'):
+            self.classifier = None
         
         # GPU 메모리 사용량 출력
         if torch.cuda.is_available():
             print(f"모델 GPU 메모리 사용량: {torch.cuda.memory_allocated(0) / 1024**3:.2f}GB")
-        
-        # 레이블 매핑 저장
-        self.label_to_id = {}
-        self.id_to_label = {}
-        self.label_embeddings = {}
         
     def load_classifier(self, model_dir):
         """저장된 분류기 가중치를 로드합니다."""
@@ -59,6 +62,9 @@ class XMLRoBERTaClassifier:
             with open(classifier_path, 'rb') as f:
                 self.classifier = pickle.load(f)
                 self.classifier.to(self.device)
+                print(f"분류기 로드 완료: {self.classifier.in_features} → {self.classifier.out_features}")
+        else:
+            print(f"분류기 파일이 없습니다: {classifier_path}")
         
         # 레이블 매핑 로드
         label_map_path = os.path.join(model_dir, "label_mapping.json")
@@ -72,6 +78,9 @@ class XMLRoBERTaClassifier:
         if os.path.exists(embeddings_path):
             with open(embeddings_path, 'rb') as f:
                 self.label_embeddings = pickle.load(f)
+                print(f"레이블 임베딩 로드 완료: {len(self.label_embeddings)}개")
+        else:
+            print(f"레이블 임베딩 파일이 없습니다: {embeddings_path}")
     
     def save_model(self, save_dir):
         """모델과 분류기를 저장합니다."""
@@ -98,21 +107,51 @@ class XMLRoBERTaClassifier:
         texts = []
         labels = []
         
+        print(f"JSONL 파일 경로: {jsonl_path}")
+        print(f"파일 존재 여부: {os.path.exists(jsonl_path)}")
+        
         with open(jsonl_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line.strip())
-                
-                # input_text1, input_text2, input_text3을 결합
-                combined_text = f"{data.get('input_text1', '')} {data.get('input_text2', '')} {data.get('input_text3', '')}".strip()
-                
-                if combined_text and data.get('label'):
-                    texts.append(combined_text)
-                    labels.append(data['label'])
+            for i, line in enumerate(f):
+                try:
+                    data = json.loads(line.strip())
+                    print(f"라인 {i+1}: {list(data.keys())}")
+                    
+                    # 각 input_text를 개별 샘플로 처리 (1~10)
+                    label = data.get('Label', '')
+                    if not label:
+                        print(f"라인 {i+1}: 라벨이 없음, 스킵")
+                        continue
+                    
+                    sample_count = 0
+                    for j in range(1, 11):  # input_text 1부터 10까지
+                        text_key = f'input_text {j}'
+                        text = data.get(text_key, '').strip()
+                        
+                        if text:  # 텍스트가 있으면 개별 샘플로 추가
+                            texts.append(text)
+                            labels.append(label)
+                            sample_count += 1
+                            print(f"샘플 추가: {label} -> {text[:30]}...")
+                    
+                    print(f"라인 {i+1} ({label}): {sample_count}개 샘플 추가")
+                except json.JSONDecodeError as e:
+                    print(f"JSON 파싱 오류 라인 {i+1}: {e}")
+        
+        print(f"최종 결과: {len(texts)}개 텍스트, {len(labels)}개 라벨")
         
         # 레이블 매핑 생성
         unique_labels = list(set(labels))
         self.label_to_id = {label: i for i, label in enumerate(unique_labels)}
         self.id_to_label = {i: label for label, i in self.label_to_id.items()}
+        
+        print(f"레이블 매핑 생성 완료: {len(self.label_to_id)}개 고유 라벨")
+        
+        # 올바른 크기의 분류기 생성 (레이블 수에 맞춤)
+        num_labels = len(self.label_to_id)
+        self.classifier = nn.Linear(self.model.config.hidden_size, num_labels)
+        self.classifier.to(self.device)
+        
+        print(f"분류기 생성 완료: 입력 {self.model.config.hidden_size} → 출력 {num_labels}")
         
         # 레이블 임베딩 생성
         self._create_label_embeddings(texts, labels)
@@ -144,9 +183,34 @@ class XMLRoBERTaClassifier:
             if embeddings:
                 self.label_embeddings[label] = np.mean(embeddings, axis=0)
     
-    def train(self, texts, labels, epochs=3, batch_size=8):
+    def train(self, texts, labels, epochs=3, batch_size=8, learning_rate=2e-5):
         """모델을 학습합니다."""
-        print(f"GPU 학습 시작: {self.device}")
+        
+        # RTX 4080 최적화를 위한 동적 배치 크기 조정
+        if torch.cuda.is_available():
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            if gpu_memory >= 16:  # RTX 4080 (16GB) 이상
+                if batch_size < 32:
+                    batch_size = min(64, max(32, batch_size))  # 최소 32, 최대 64
+                    learning_rate = min(5e-5, learning_rate * 2)  # 큰 배치에 맞춰 학습률 조정
+                    print(f"🚀 RTX 4080 최적화: 배치 크기 {batch_size}, 학습률 {learning_rate}")
+        
+        print(f"\n🚀 모델 학습 시작!")
+        print(f"{'='*60}")
+        print(f"📊 학습 설정:")
+        print(f"  📝 샘플 수: {len(texts)}개")
+        print(f"  🏷️  고유 라벨: {len(set(labels))}개")
+        print(f"  📦 배치 크기: {batch_size}")
+        print(f"  📚 학습률: {learning_rate}")
+        print(f"  🔄 에포크: {epochs}")
+        print(f"  💻 장치: {self.device}")
+        if torch.cuda.is_available():
+            print(f"  🖥️  GPU: {torch.cuda.get_device_name(0)}")
+            print(f"  💾 GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+            print(f"  🔥 혼합 정밀도 학습: 활성화")
+            print(f"  ⚡ GPU 최적화: RTX 4080 전용 설정")
+        print(f"{'='*60}\n")
+        
         if torch.cuda.is_available():
             print(f"GPU 메모리 사용량 (학습 전): {torch.cuda.memory_allocated(0) / 1024**3:.2f}GB")
         
@@ -172,52 +236,111 @@ class XMLRoBERTaClassifier:
             num_workers=0 if torch.cuda.is_available() else 2  # GPU 사용 시 단일 워커
         )
         
-        # 옵티마이저 및 손실 함수
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=2e-5)
-        criterion = nn.CrossEntropyLoss()
+        # RTX 4080 최적화 옵티마이저 및 손실 함수
+        optimizer = torch.optim.AdamW(
+            list(self.model.parameters()) + list(self.classifier.parameters()), 
+            lr=learning_rate,
+            weight_decay=0.01,  # 정규화
+            eps=1e-6  # RTX 4080 혼합 정밀도 최적화
+        )
+        
+        # 학습률 스케줄러 추가 (GPU 효율성 향상)
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate/10)
+        
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)  # 라벨 스무딩으로 일반화 성능 향상
+        
+        # RTX 4080 혼합 정밀도 최적화를 위한 GradScaler
+        scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
         
         # 학습 루프
         self.model.train()
+        self.classifier.train()
+        
         for epoch in range(epochs):
             total_loss = 0
+            correct_predictions = 0
+            total_predictions = 0
+            
+            print(f"\n{'='*50}")
+            print(f"Epoch {epoch+1}/{epochs} 시작")
+            print(f"{'='*50}")
+            
             for batch_idx, batch in enumerate(dataloader):
                 input_ids, attention_mask, label_ids = [b.to(self.device, non_blocking=True) for b in batch]
                 
                 optimizer.zero_grad()
                 
-                # 혼합 정밀도 학습 (GPU 사용 시)
-                if torch.cuda.is_available():
+                # RTX 4080 최적화 혼합 정밀도 학습
+                if torch.cuda.is_available() and scaler is not None:
                     with torch.cuda.amp.autocast():
                         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                         logits = self.classifier(outputs.last_hidden_state[:, 0, :])
                         loss = criterion(logits, label_ids)
+                    
+                    # GradScaler로 역전파 최적화
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
                     outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                     logits = self.classifier(outputs.last_hidden_state[:, 0, :])
                     loss = criterion(logits, label_ids)
-                
-                loss.backward()
-                optimizer.step()
+                    loss.backward()
+                    optimizer.step()
                 
                 total_loss += loss.item()
+                
+                # 정확도 계산 (학습 중)
+                _, predicted = torch.max(logits, 1)
+                correct_predictions += (predicted == label_ids).sum().item()
+                total_predictions += label_ids.size(0)
+                
+                # 배치별 진행상황 출력 (10배치마다)
+                if batch_idx % 10 == 0:
+                    batch_accuracy = (predicted == label_ids).sum().item() / label_ids.size(0)
+                    print(f"  Batch {batch_idx+1}/{len(dataloader)}: Loss={loss.item():.4f}, Accuracy={batch_accuracy:.2%}")
                 
                 # GPU 메모리 정리 (주기적으로)
                 if torch.cuda.is_available() and batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
             
-            avg_loss = total_loss/len(dataloader)
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+            # 에포크별 전체 지표
+            avg_loss = total_loss / len(dataloader)
+            epoch_accuracy = correct_predictions / total_predictions if total_predictions > 0 else 0
+            
+            print(f"\n📊 Epoch {epoch+1}/{epochs} 결과:")
+            print(f"  📉 평균 Loss: {avg_loss:.6f}")
+            print(f"  🎯 정확도: {epoch_accuracy:.2%} ({correct_predictions}/{total_predictions})")
+            print(f"  ⏱️  배치 수: {len(dataloader)}")
             
             if torch.cuda.is_available():
-                print(f"GPU 메모리 사용량 (Epoch {epoch+1} 후): {torch.cuda.memory_allocated(0) / 1024**3:.2f}GB")
+                gpu_memory = torch.cuda.memory_allocated(0) / 1024**3
+                print(f"  🖥️  GPU 메모리: {gpu_memory:.2f}GB")
+            
+            # 학습률 스케줄러 업데이트
+            current_lr = scheduler.get_last_lr()[0]
+            scheduler.step()
+            next_lr = scheduler.get_last_lr()[0]
+            print(f"  📚 학습률: {current_lr:.2e} → {next_lr:.2e}")
+            
+            print(f"{'='*50}")
         
         # 학습 완료 후 GPU 메모리 정리
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            print(f"학습 완료 후 GPU 메모리: {torch.cuda.memory_allocated(0) / 1024**3:.2f}GB")
+            print(f"\n🎉 학습 완료!")
+            print(f"{'='*60}")
+            print(f"📊 최종 학습 결과:")
+            print(f"  🔄 총 에포크: {epochs}")
+            print(f"  📝 총 샘플: {len(texts)}개")
+            print(f"  🏷️  고유 라벨: {len(set(labels))}개")
+            print(f"  🖥️  GPU 메모리: {torch.cuda.memory_allocated(0) / 1024**3:.2f}GB")
+            print(f"{'='*60}\n")
     
     def predict(self, text, top_k=3):
         """텍스트에 대한 예측을 수행합니다."""
+        print(f"예측 시작: '{text}', 레이블 임베딩 수: {len(self.label_embeddings)}")
         self.model.eval()
         
         # 입력 텍스트 토크나이징
@@ -228,11 +351,22 @@ class XMLRoBERTaClassifier:
             outputs = self.model(**inputs)
             text_embedding = outputs.last_hidden_state[:, 0, :].cpu().numpy()
         
+        print(f"텍스트 임베딩 크기: {text_embedding.shape}")
+        
         # 레이블 임베딩과의 유사도 계산
         similarities = {}
         for label, label_embedding in self.label_embeddings.items():
-            similarity = self._cosine_similarity(text_embedding[0], label_embedding)
-            similarities[label] = similarity
+            try:
+                # 차원 맞추기: label_embedding이 (1, 768)이면 flatten
+                if label_embedding.ndim > 1:
+                    label_embedding = label_embedding.flatten()
+                similarity = self._cosine_similarity(text_embedding[0], label_embedding)
+                similarities[label] = similarity
+            except Exception as e:
+                print(f"유사도 계산 오류 ({label}): {e}")
+                print(f"label_embedding 크기: {label_embedding.shape if hasattr(label_embedding, 'shape') else type(label_embedding)}")
+        
+        print(f"유사도 계산 완료: {len(similarities)}개")
         
         # 유사도 기준으로 정렬
         sorted_similarities = sorted(similarities.items(), key=lambda x: x[1], reverse=True)
@@ -246,6 +380,7 @@ class XMLRoBERTaClassifier:
                 'similarity': float(similarity * 100)  # 백분율로 변환
             })
         
+        print(f"최종 결과 수: {len(results)}")
         return results
     
     def _cosine_similarity(self, vec1, vec2):
